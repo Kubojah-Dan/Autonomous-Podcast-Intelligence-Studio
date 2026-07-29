@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: pulsevault-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+
+  backend:
+    build: ./backend
+    container_name: pulsevault-backend
+    restart: unless-stopped
+    depends_on: [mongo]
+    volumes:
+      - ./backend:/app
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: pulsevault
+      CORS_ORIGINS: "*"
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_LLM_MODEL: llama-3.3-70b-versatile
+      GEMINI_MODEL: gemini-2.0-flash
+    ports:
+      - "8001:8001"
+
+  frontend:
+    build: ./frontend
+    container_name: pulsevault-frontend
+    restart: unless-stopped
+    depends_on: [backend]
+    volumes:
+      - ./frontend/src:/app/src
+    environment:
+      REACT_APP_BACKEND_URL: http://localhost:8001
+    ports:
+      - "3000:3000"
+
+  mcp-chrome:
+    build: ./mcp-chrome
+    container_name: pulsevault-mcp
+    restart: unless-stopped
+    environment:
+      PORT: 8765
+    ports:
+      - "8765:8765"
+
+volumes:
+  mongo_data:
