@@ -15,8 +15,11 @@ services:
     container_name: pulsevault-backend
     restart: unless-stopped
     depends_on: [mongo]
+    env_file:
+      - .env
     volumes:
       - ./backend:/app
+      - tts_media:/app/media
     environment:
       MONGO_URL: mongodb://mongo:27017
       DB_NAME: pulsevault
@@ -25,6 +28,15 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY}
       GROQ_LLM_MODEL: llama-3.3-70b-versatile
       GEMINI_MODEL: gemini-2.0-flash
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      TTS_PROVIDER: ${TTS_PROVIDER:-elevenlabs}
+      TTS_DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-narrator}
+      TTS_CACHE_DIR: ${TTS_CACHE_DIR:-media/tts}
+      YT_DLP_COOKIES_FILE: ${YT_DLP_COOKIES_FILE}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
+      INGEST_MAX_DURATION_SECONDS: ${INGEST_MAX_DURATION_SECONDS:-10800}
+      HUNTER_IO_API_KEY: ${HUNTER_IO_API_KEY}
     ports:
       - "8001:8001"
 
@@ -51,3 +63,4 @@ services:
 
 volumes:
   mongo_data:
+  tts_media:

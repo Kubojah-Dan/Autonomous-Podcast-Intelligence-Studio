@@ -45,3 +45,5 @@ Thumbs.db
 *.swp
 
 .vscode/
+backend/cookies.txt
+backend/media/

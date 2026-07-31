@@ -1,4 +1,4 @@
-"""PulseVault AI — Autonomous Podcast Intelligence Studio backend."""
+"""PulseVault AI — Autonomous Podcast Intelligence Studio backend v2."""
 import os
 import json
 import asyncio
@@ -10,11 +10,16 @@ from typing import Optional, Dict, List, Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from groq import Groq
+
+from services.ingest_router import UniversalIngestRouter
+from services.voice_agent import VoiceAgent
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -35,9 +40,15 @@ episodes_col = db["episodes"]
 events_col = db["events"]
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+ingest_router = UniversalIngestRouter()
+voice_agent = VoiceAgent()
 
 # In-memory pub/sub for WebSocket streaming per job
 job_queues: Dict[str, "asyncio.Queue[dict]"] = {}
+
+# Media directory setup
+MEDIA_DIR = ROOT_DIR / "media"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -------------------- Demo transcripts --------------------
@@ -101,13 +112,10 @@ class IngestRequest(BaseModel):
     title: Optional[str] = None
 
 
-class EpisodeOut(BaseModel):
-    id: str
-    url: str
-    title: Optional[str] = None
-    status: str
-    created_at: str
-    result: Optional[Dict[str, Any]] = None
+class TTSSynthesizeRequest(BaseModel):
+    text: str
+    profile: Optional[str] = "narrator"
+    artifact_id: Optional[str] = None
 
 
 # -------------------- LLM helpers --------------------
@@ -147,7 +155,6 @@ async def gemini_chat(prompt: str, max_tokens: int = 1200) -> str:
 
 
 async def smart_chat(prompt: str, system: str = "You are a helpful assistant.", max_tokens: int = 1000, prefer: str = "gemini", json_mode: bool = False) -> str:
-    """Try preferred provider first, fall back to the other on any failure."""
     providers = [prefer, "groq" if prefer == "gemini" else "gemini"]
     last_err = None
     for p in providers:
@@ -193,7 +200,6 @@ def _strip_json(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
-        # remove leading language tag like "json"
         first_nl = text.find("\n")
         if first_nl != -1:
             text = text[first_nl + 1:]
@@ -207,7 +213,6 @@ async def parse_json_response(text: str) -> Any:
     try:
         return json.loads(cleaned)
     except Exception:
-        # try to find first { or [
         for start in ("[", "{"):
             i = cleaned.find(start)
             if i != -1:
@@ -231,18 +236,24 @@ async def log_agent(job_id: str, agent: str, message: str, level: str = "info"):
     await emit(job_id, {"type": "log", "agent": agent, "level": level, "message": message})
 
 
-# -------------------- Agent pipeline --------------------
+# -------------------- Agent pipeline v2 --------------------
 async def run_pipeline(job_id: str, url: str, demo_id: Optional[str], title: Optional[str]):
     try:
-        await log_agent(job_id, "ORCHESTRATOR", ">>> booting agent swarm for job " + job_id[:8])
+        await log_agent(job_id, "ORCHESTRATOR", ">>> booting 11-agent swarm for job " + job_id[:8])
         await log_agent(job_id, "ORCHESTRATOR", "target url = " + url)
 
-        # 1. AudioIngestAgent
-        await log_agent(job_id, "AUDIO_INGEST", "acquiring audio stream...")
+        # 1. AUDIO_INGEST Agent (Universal Router)
+        await log_agent(job_id, "AUDIO_INGEST", "resolving platform & acquiring stream via Universal Router...")
+        ingest_res = await ingest_router.resolve(url, custom_title=title)
+        
+        await log_agent(job_id, "AUDIO_INGEST", f"resolved source platform: {ingest_res.source_platform} [kind: {ingest_res.kind}]")
+        if ingest_res.drm_notice:
+            await log_agent(job_id, "AUDIO_INGEST", ingest_res.drm_notice, level="warn")
+
         transcript = None
-        detected_title = title
-        detected_host = None
-        detected_guest = None
+        detected_title = ingest_res.title or title
+        detected_host = ingest_res.host
+        detected_guest = ingest_res.guest
 
         if demo_id and demo_id in DEMO_EPISODES:
             demo = DEMO_EPISODES[demo_id]
@@ -251,21 +262,40 @@ async def run_pipeline(job_id: str, url: str, demo_id: Optional[str], title: Opt
             detected_host = demo["host"]
             detected_guest = demo["guest"]
             await log_agent(job_id, "AUDIO_INGEST", f"loaded demo transcript '{demo['title']}' [{len(transcript)} chars]")
-        else:
+        elif ingest_res.audio_path and os.path.exists(ingest_res.audio_path):
             try:
-                await log_agent(job_id, "AUDIO_INGEST", "calling groq whisper-large-v3 on url...")
-                transcript = await asyncio.wait_for(groq_transcribe_url(url), timeout=120)
+                await log_agent(job_id, "AUDIO_INGEST", "transcribing local audio file with Whisper-large-v3...")
+                with open(ingest_res.audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                def _transcribe_file():
+                    r = groq_client.audio.transcriptions.create(
+                        model="whisper-large-v3",
+                        file=(Path(ingest_res.audio_path).name, audio_bytes),
+                        temperature=0.0,
+                    )
+                    return r.text
+                transcript = await asyncio.to_thread(_transcribe_file)
+                await log_agent(job_id, "AUDIO_INGEST", f"transcribed file [{len(transcript)} chars]")
+            except Exception as e:
+                await log_agent(job_id, "AUDIO_INGEST", f"file transcription failed: {e}", level="warn")
+        elif ingest_res.audio_url:
+            try:
+                await log_agent(job_id, "AUDIO_INGEST", "calling groq whisper-large-v3 on resolved url...")
+                transcript = await asyncio.wait_for(groq_transcribe_url(ingest_res.audio_url), timeout=120)
                 await log_agent(job_id, "AUDIO_INGEST", f"transcribed [{len(transcript)} chars]")
             except Exception as e:
                 await log_agent(job_id, "AUDIO_INGEST", f"transcription failed: {e}", level="warn")
-                await log_agent(job_id, "AUDIO_INGEST", "falling back to metadata-only mode")
-                transcript = (
-                    f"[No direct audio transcription available for the provided URL: {url}]\n"
-                    "The following agents will operate on the URL metadata only. "
-                    "For best results, provide a direct .mp3/.wav audio URL or use a demo episode."
-                )
 
-        if not detected_title and transcript and len(transcript) > 50 and not transcript.startswith("[No direct"):
+        if not transcript:
+            await log_agent(job_id, "AUDIO_INGEST", "falling back to metadata mode")
+            transcript = (
+                f"[Episode metadata for: {detected_title or url}]\n"
+                f"Platform: {ingest_res.source_platform or 'Universal Ingest'}\n"
+                "This transcript was constructed for metadata analysis. For full audio transcription, "
+                "upload an MP3/WAV file directly or use a demo episode."
+            )
+
+        if not detected_title and transcript and len(transcript) > 50 and not transcript.startswith("[Episode metadata"):
             try:
                 title_prompt = (
                     "Based on the following transcript, generate a concise, professional, engaging episode title (3-7 words). "
@@ -280,61 +310,46 @@ async def run_pipeline(job_id: str, url: str, demo_id: Optional[str], title: Opt
 
         await emit(job_id, {"type": "milestone", "step": "transcript", "chars": len(transcript)})
 
-        # Parallel: TopicMiner (Gemini) + QuoteHunter (Groq) + SocialCopy (Gemini)
-        transcript_slice = transcript[:8000]
+        # Phase 1 Parallel Swarm Execution (TopicMiner + QuoteHunter + SocialCopy + Chapters + FactCheck + Sentiment)
+        transcript_slice = transcript[:9000]
 
         async def topic_miner():
-            await log_agent(job_id, "TOPIC_MINER", "extracting key topics via gemini (fallback: groq)...")
+            await log_agent(job_id, "TOPIC_MINER", "extracting key topics via gemini...")
             prompt = (
-                "Extract the key topics from this podcast transcript. "
-                "Return STRICT JSON array of 5 objects with fields: "
-                '{"topic": "short 2-5 word title", "summary": "one-sentence explanation", "importance": 1-10}. '
-                "No prose, JSON only.\n\nTranscript:\n" + transcript_slice
+                "Extract 5 key topics from this transcript. Return STRICT JSON array of objects: "
+                '{"topic": "2-5 word title", "summary": "one sentence explanation", "importance": 1-10}. JSON only.\n\n' + transcript_slice
             )
             try:
                 raw = await smart_chat(prompt, system="You output ONLY valid JSON.", max_tokens=800, prefer="gemini", json_mode=True)
-                topics_raw = await parse_json_response(raw)
-                # Handle both array response and {"topics":[...]} shape
-                if isinstance(topics_raw, dict):
-                    topics = topics_raw.get("topics") or list(topics_raw.values())[0] if topics_raw else []
-                else:
-                    topics = topics_raw or []
+                res = await parse_json_response(raw)
+                topics = res if isinstance(res, list) else (res.get("topics") if isinstance(res, dict) else [])
             except Exception as e:
                 await log_agent(job_id, "TOPIC_MINER", f"error: {e}", level="error")
                 topics = []
             await log_agent(job_id, "TOPIC_MINER", f"found {len(topics)} topics")
-            return topics
+            return topics or []
 
         async def quote_hunter():
             await log_agent(job_id, "QUOTE_HUNTER", "scanning for viral quotes via groq...")
             prompt = (
-                "Find the 5 most shareable, tweet-worthy quotes from this transcript. "
-                "Return STRICT JSON array of objects with fields: "
-                '{"quote": "the exact or lightly cleaned quote", "speaker": "best guess or Unknown", "punch": "why it hits (max 10 words)"}. '
-                "No prose, JSON only.\n\nTranscript:\n" + transcript_slice
+                "Find 5 tweet-worthy quotes from this transcript. Return STRICT JSON array of objects: "
+                '{"quote": "exact or lightly cleaned quote", "speaker": "Host/Guest/Unknown", "punch": "why it hits (max 10 words)"}. JSON only.\n\n' + transcript_slice
             )
             try:
                 raw = await groq_chat(prompt, system="You output ONLY valid JSON.", max_tokens=900, json_mode=True)
-                quotes_raw = await parse_json_response(raw)
-                if isinstance(quotes_raw, dict):
-                    quotes = quotes_raw.get("quotes") or (list(quotes_raw.values())[0] if quotes_raw else [])
-                else:
-                    quotes = quotes_raw or []
+                res = await parse_json_response(raw)
+                quotes = res if isinstance(res, list) else (res.get("quotes") if isinstance(res, dict) else [])
             except Exception as e:
                 await log_agent(job_id, "QUOTE_HUNTER", f"error: {e}", level="error")
                 quotes = []
             await log_agent(job_id, "QUOTE_HUNTER", f"harvested {len(quotes)} quotes")
-            return quotes
+            return quotes or []
 
         async def social_copy():
             await log_agent(job_id, "SOCIAL_COPY", "generating captions for twitter, linkedin, instagram...")
             prompt = (
-                "Given this podcast transcript, write social media copy. "
-                "Return STRICT JSON with keys 'twitter', 'linkedin', 'instagram'. "
-                "Twitter: max 260 chars, punchy, includes 1-2 hashtags. "
-                "LinkedIn: 3-4 short paragraphs, professional but bold, ends with a question. "
-                "Instagram: hook line + 4 bullet takeaways + 5 relevant hashtags. "
-                "JSON only.\n\nTranscript:\n" + transcript_slice
+                "Given this podcast transcript, write social media copy. Return STRICT JSON with keys 'twitter', 'linkedin', 'instagram'. "
+                "Twitter: max 260 chars, punchy + hashtags. LinkedIn: 3 short paragraphs + question. Instagram: hook + 4 bullets + hashtags. JSON only.\n\n" + transcript_slice
             )
             try:
                 raw = await smart_chat(prompt, system="You output ONLY valid JSON.", max_tokens=1200, prefer="gemini", json_mode=True)
@@ -345,47 +360,141 @@ async def run_pipeline(job_id: str, url: str, demo_id: Optional[str], title: Opt
                     if isinstance(v, str):
                         copy[k] = v
                     elif isinstance(v, dict):
-                        parts = []
-                        if v.get("hook"):
-                            parts.append(str(v["hook"]))
-                        if isinstance(v.get("bullets"), list):
-                            parts.append("\n".join(f"• {b}" for b in v["bullets"]))
-                        if isinstance(v.get("hashtags"), list):
-                            parts.append(" ".join(v["hashtags"]))
-                        if not parts:
-                            parts.append(json.dumps(v, ensure_ascii=False))
-                        copy[k] = "\n\n".join(parts)
-                    elif isinstance(v, list):
-                        copy[k] = "\n".join(str(x) for x in v)
+                        copy[k] = "\n\n".join(str(val) for val in v.values() if val)
+                    else:
+                        copy[k] = str(v or "")
             except Exception as e:
                 await log_agent(job_id, "SOCIAL_COPY", f"error: {e}", level="error")
                 copy = {}
             await log_agent(job_id, "SOCIAL_COPY", f"generated {len(copy)} platform captions")
             return copy
 
-        topics, quotes, social = await asyncio.gather(topic_miner(), quote_hunter(), social_copy())
+        async def chapters_agent():
+            await log_agent(job_id, "CHAPTERS_AGENT", "analyzing topic shifts & generating timestamped chapter markers...")
+            prompt = (
+                "Analyze transcript and create 5-7 chapter markers. Return STRICT JSON array of objects: "
+                '{"timestamp": "MM:SS", "seconds": int, "title": "short chapter title", "summary": "one sentence"}. JSON only.\n\n' + transcript_slice
+            )
+            try:
+                raw = await smart_chat(prompt, system="You output ONLY valid JSON.", max_tokens=800, prefer="gemini", json_mode=True)
+                res = await parse_json_response(raw)
+                chapters = res if isinstance(res, list) else (res.get("chapters") if isinstance(res, dict) else [])
+            except Exception as e:
+                await log_agent(job_id, "CHAPTERS_AGENT", f"error: {e}", level="error")
+                chapters = []
+            await log_agent(job_id, "CHAPTERS_AGENT", f"generated {len(chapters)} chapter markers")
+            return chapters or []
 
-        # ShowNotes agent depends on topics + quotes
-        await log_agent(job_id, "SHOW_NOTES", "composing SEO markdown notes via groq...")
-        top_json = json.dumps(topics, ensure_ascii=False)[:2000]
-        quote_json = json.dumps(quotes, ensure_ascii=False)[:2000]
-        show_notes_prompt = (
-            "Write SEO-optimized podcast show notes in Markdown. "
-            "Structure: # Title, > 1-sentence hook, ## Overview (2 paragraphs), "
-            "## Key Topics (bullet list from topics), ## Best Quotes (blockquotes from quotes), "
-            "## Chapters (mock timestamped list of 5 chapters starting 00:00), "
-            "## Resources (3 plausible resources). Keep it under 500 words. Return ONLY markdown.\n\n"
-            f"Episode title: {detected_title or 'Untitled Episode'}\n"
-            f"Topics JSON: {top_json}\nQuotes JSON: {quote_json}"
+        async def fact_check_agent():
+            await log_agent(job_id, "FACT_CHECK_AGENT", "verifying factual claims & checking sources...")
+            prompt = (
+                "Extract 4 key factual claims made in transcript. Return STRICT JSON array of objects: "
+                '{"claim": "statement made", "speaker": "Speaker", "verdict": "VERIFIED|NEEDS_CONTEXT|UNVERIFIED", "source": "reference or rationale"}. JSON only.\n\n' + transcript_slice
+            )
+            try:
+                raw = await groq_chat(prompt, system="You output ONLY valid JSON.", max_tokens=800, json_mode=True)
+                res = await parse_json_response(raw)
+                claims = res if isinstance(res, list) else (res.get("claims") if isinstance(res, dict) else [])
+            except Exception as e:
+                await log_agent(job_id, "FACT_CHECK_AGENT", f"error: {e}", level="error")
+                claims = []
+            await log_agent(job_id, "FACT_CHECK_AGENT", f"verified {len(claims)} factual claims")
+            return claims or []
+
+        async def sentiment_mapper():
+            await log_agent(job_id, "SENTIMENT_MAPPER", "mapping emotional arc timeline & viral peaks...")
+            prompt = (
+                "Map emotional arc over episode duration into 6 points. Return STRICT JSON array of objects: "
+                '{"timestamp": "MM:SS", "sentiment_score": float -1.0 to 1.0, "intensity": 1-10, "emotion": "curiosity|excitement|debate|insight", "is_viral_peak": bool}. JSON only.\n\n' + transcript_slice
+            )
+            try:
+                raw = await smart_chat(prompt, system="You output ONLY valid JSON.", max_tokens=800, prefer="gemini", json_mode=True)
+                res = await parse_json_response(raw)
+                arc = res if isinstance(res, list) else (res.get("arc") if isinstance(res, dict) else [])
+            except Exception as e:
+                await log_agent(job_id, "SENTIMENT_MAPPER", f"error: {e}", level="error")
+                arc = []
+            await log_agent(job_id, "SENTIMENT_MAPPER", f"mapped {len(arc)} emotional arc segments")
+            return arc or []
+
+        # Run 6 agents in parallel
+        topics, quotes, social, chapters, claims, sentiment = await asyncio.gather(
+            topic_miner(), quote_hunter(), social_copy(), chapters_agent(), fact_check_agent(), sentiment_mapper()
         )
-        try:
-            show_notes = await groq_chat(show_notes_prompt, system="You write publish-ready Markdown.", max_tokens=1400)
-        except Exception as e:
-            await log_agent(job_id, "SHOW_NOTES", f"error: {e}", level="error")
-            show_notes = "# Show Notes\n\nGeneration failed."
-        await log_agent(job_id, "SHOW_NOTES", f"produced {len(show_notes)} chars of markdown")
 
-        await log_agent(job_id, "ORCHESTRATOR", "<<< pipeline complete. sealing artifact.")
+        # Phase 2 Agents: ClipCutter + GuestResearcher + ShowNotes
+        async def clip_cutter():
+            await log_agent(job_id, "CLIP_CUTTER", "generating 9:16 vertical video specs & subtitle configs...")
+            prompt = (
+                "Select top 3 viral clip candidates from quotes & sentiment. Return STRICT JSON array of objects: "
+                '{"title": "clip title", "start": "01:15", "end": "01:45", "duration_sec": 30, "hook": "screen hook subtitle", "viral_score": 95, "layout": "9:16 vertical"}. JSON only.\n\n'
+                f"Quotes: {json.dumps(quotes[:3])}\nTranscript slice: {transcript_slice[:2000]}"
+            )
+            try:
+                raw = await groq_chat(prompt, system="You output ONLY valid JSON.", max_tokens=800, json_mode=True)
+                res = await parse_json_response(raw)
+                clips = res if isinstance(res, list) else (res.get("clips") if isinstance(res, dict) else [])
+            except Exception as e:
+                await log_agent(job_id, "CLIP_CUTTER", f"error: {e}", level="error")
+                clips = []
+            await log_agent(job_id, "CLIP_CUTTER", f"produced {len(clips)} vertical clip specs")
+            return clips or []
+
+        async def guest_researcher():
+            await log_agent(job_id, "GUEST_RESEARCH", "building guest dossier & contact enrichment...")
+            guest_name = detected_guest or "Guest Expert"
+            prompt = (
+                f"Provide a brief profile & outreach email for guest '{guest_name}' based on transcript. "
+                "Return STRICT JSON object with keys: 'name', 'bio', 'linkedin_url', 'contact_email_hint', 'talking_points' (list of 3), 'pitch_email_draft'. JSON only.\n\n" + transcript_slice[:3000]
+            )
+            try:
+                raw = await smart_chat(prompt, system="You output ONLY valid JSON.", max_tokens=800, prefer="gemini", json_mode=True)
+                dossier = await parse_json_response(raw) or {}
+            except Exception as e:
+                await log_agent(job_id, "GUEST_RESEARCH", f"error: {e}", level="error")
+                dossier = {}
+            await log_agent(job_id, "GUEST_RESEARCH", f"compiled dossier for {guest_name}")
+            return dossier
+
+        async def show_notes():
+            await log_agent(job_id, "SHOW_NOTES", "composing SEO markdown notes via groq...")
+            top_json = json.dumps(topics, ensure_ascii=False)[:1500]
+            quote_json = json.dumps(quotes, ensure_ascii=False)[:1500]
+            show_notes_prompt = (
+                "Write SEO-optimized podcast show notes in Markdown. "
+                "Structure: # Title, > 1-sentence hook, ## Overview (2 paragraphs), "
+                "## Key Topics (bullet list), ## Best Quotes (blockquotes), "
+                "## Chapters, ## Fact-Check Highlights, ## Resources. Keep under 500 words. ONLY markdown.\n\n"
+                f"Episode title: {detected_title or 'Untitled Episode'}\n"
+                f"Topics: {top_json}\nQuotes: {quote_json}"
+            )
+            try:
+                notes = await groq_chat(show_notes_prompt, system="You write publish-ready Markdown.", max_tokens=1400)
+            except Exception as e:
+                await log_agent(job_id, "SHOW_NOTES", f"error: {e}", level="error")
+                notes = "# Show Notes\n\nGeneration failed."
+            await log_agent(job_id, "SHOW_NOTES", f"produced {len(notes)} chars of markdown")
+            return notes
+
+        clips, guest_dossier, show_notes_md = await asyncio.gather(clip_cutter(), guest_researcher(), show_notes())
+
+        # Phase 3 Agent: VOICE_AGENT (Synthesize audio for overview summary & key quote)
+        await log_agent(job_id, "VOICE_AGENT", "synthesizing voice audio narrations for overview & top quote...")
+        overview_audio = None
+        quote_audio = None
+        try:
+            summary_text = f"Welcome to {detected_title or 'this episode'}. Here is your podcast briefing. " + (topics[0]["summary"] if topics else "")
+            ov_res = await voice_agent.synthesize(summary_text, profile="narrator", artifact_id=f"{job_id}_overview")
+            overview_audio = ov_res["audio_url"]
+            if quotes:
+                top_q = quotes[0].get("quote") or ""
+                q_res = await voice_agent.synthesize(top_q, profile="dramatic", artifact_id=f"{job_id}_quote")
+                quote_audio = q_res["audio_url"]
+            await log_agent(job_id, "VOICE_AGENT", "voice audio synthesis complete")
+        except Exception as e:
+            await log_agent(job_id, "VOICE_AGENT", f"voice synthesis warning: {e}", level="warn")
+
+        await log_agent(job_id, "ORCHESTRATOR", "<<< 11-agent pipeline complete. sealing artifact.")
 
         final_title = detected_title or title or "Untitled Episode"
 
@@ -398,8 +507,17 @@ async def run_pipeline(job_id: str, url: str, demo_id: Optional[str], title: Opt
             "transcript_length": len(transcript),
             "topics": topics,
             "quotes": quotes,
-            "show_notes_md": show_notes,
+            "show_notes_md": show_notes_md,
             "social": social,
+            "chapters": chapters,
+            "claims": claims,
+            "sentiment": sentiment,
+            "clips": clips,
+            "guest_dossier": guest_dossier,
+            "overview_audio": overview_audio,
+            "quote_audio": quote_audio,
+            "platform": ingest_res.source_platform or "universal",
+            "drm_notice": ingest_res.drm_notice,
         }
 
         await episodes_col.update_one(
@@ -425,8 +543,11 @@ async def run_pipeline(job_id: str, url: str, demo_id: Optional[str], title: Opt
 
 
 # -------------------- FastAPI app --------------------
-app = FastAPI(title="PulseVault AI")
+app = FastAPI(title="PulseVault AI v2")
 api = APIRouter(prefix="/api")
+
+# Serve media static files (for TTS MP3 files)
+app.mount("/media", StaticFiles(directory=str(MEDIA_DIR.parent)), name="media")
 
 
 class TitleUpdate(BaseModel):
@@ -441,18 +562,18 @@ async def update_episode_title(job_id: str, req: TitleUpdate):
     new_title = req.title.strip()
     if not new_title:
         raise HTTPException(400, "title cannot be empty")
-    
+
     update_fields = {"title": new_title}
     if doc.get("result"):
         update_fields["result.title"] = new_title
-        
+
     await episodes_col.update_one({"id": job_id}, {"$set": update_fields})
     return {"status": "ok", "title": new_title}
 
 
 @api.get("/")
 async def root():
-    return {"service": "pulsevault-ai", "status": "online"}
+    return {"service": "pulsevault-ai-v2", "status": "online"}
 
 
 @api.get("/demos")
@@ -477,9 +598,52 @@ async def ingest(req: IngestRequest):
     }
     await episodes_col.insert_one(doc)
     job_queues[job_id] = asyncio.Queue()
-    # kick off background task
     asyncio.create_task(run_pipeline(job_id, req.url, req.demo_id, req.title))
     return {"job_id": job_id}
+
+
+@api.post("/episode/upload")
+async def upload_audio_file(file: UploadFile = File(...), title: Optional[str] = Form(None)):
+    """Drag-and-drop local audio file ingest."""
+    file_id = str(uuid.uuid4())[:8]
+    dest_path = MEDIA_DIR / f"upload_{file_id}_{file.filename}"
+    with open(dest_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    upload_url = f"upload://{dest_path}"
+    job_id = str(uuid.uuid4())
+    doc = {
+        "id": job_id,
+        "url": upload_url,
+        "title": title or file.filename.replace("_", " ").title(),
+        "status": "running",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "result": None,
+    }
+    await episodes_col.insert_one(doc)
+    job_queues[job_id] = asyncio.Queue()
+    asyncio.create_task(run_pipeline(job_id, upload_url, None, title))
+    return {"job_id": job_id, "filename": file.filename}
+
+
+@api.post("/tts/synthesize")
+async def tts_synthesize(req: TTSSynthesizeRequest):
+    """Synthesize text artifact to audio."""
+    try:
+        res = await voice_agent.synthesize(text=req.text, profile=req.profile or "narrator", artifact_id=req.artifact_id)
+        return res
+    except Exception as e:
+        raise HTTPException(500, f"TTS synthesis failed: {e}")
+
+
+@api.post("/tts/{artifact_id}")
+async def tts_synthesize_path(artifact_id: str, req: TTSSynthesizeRequest):
+    try:
+        res = await voice_agent.synthesize(text=req.text, profile=req.profile or "narrator", artifact_id=artifact_id)
+        return res
+    except Exception as e:
+        raise HTTPException(500, f"TTS synthesis failed: {e}")
 
 
 @api.get("/episode/{job_id}")
@@ -490,10 +654,25 @@ async def get_episode(job_id: str):
     return doc
 
 
+@api.get("/episode/{job_id}/chapters.txt")
+async def download_chapters(job_id: str):
+    doc = await episodes_col.find_one({"id": job_id}, {"_id": 0})
+    if not doc or not doc.get("result"):
+        raise HTTPException(404, "chapters not found")
+    chapters = doc["result"].get("chapters") or []
+    lines = ["# Podcast Chapter Markers (.chapters.txt)", ""]
+    for ch in chapters:
+        ts = ch.get("timestamp", "00:00")
+        t = ch.get("title", "Chapter")
+        s = ch.get("summary", "")
+        lines.append(f"{ts} {t} - {s}".strip())
+    content = "\n".join(lines)
+    return PlainTextResponse(content, media_type="text/plain", headers={"Content-Disposition": f'attachment; filename="chapters_{job_id[:8]}.txt"'})
+
+
 @api.get("/vault")
 async def vault():
     docs = await episodes_col.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    # trim result on list
     for d in docs:
         if d.get("result"):
             d["result"] = {
@@ -502,6 +681,7 @@ async def vault():
                 "guest": d["result"].get("guest"),
                 "topics_count": len(d["result"].get("topics") or []),
                 "quotes_count": len(d["result"].get("quotes") or []),
+                "chapters_count": len(d["result"].get("chapters") or []),
             }
     return docs
 
@@ -509,14 +689,11 @@ async def vault():
 @app.websocket("/api/agents/stream/{job_id}")
 async def agent_stream(websocket: WebSocket, job_id: str):
     await websocket.accept()
-    # Replay past events first
     past = await events_col.find({"job_id": job_id}, {"_id": 0, "job_id": 0}).sort("ts", 1).to_list(500)
     for ev in past:
         await websocket.send_text(json.dumps(ev))
-    # Live stream
     q = job_queues.get(job_id)
     if q is None:
-        # job finished before ws connected; send done and close
         doc = await episodes_col.find_one({"id": job_id}, {"_id": 0})
         if doc and doc.get("status") == "complete":
             await websocket.send_text(json.dumps({"type": "done", "job_id": job_id}))

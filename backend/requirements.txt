@@ -27,3 +27,8 @@ jq>=1.6.0
 typer>=0.9.0
 groq
 google-genai
+httpx>=0.27.0
+yt-dlp
+feedparser
+gTTS
+elevenlabs

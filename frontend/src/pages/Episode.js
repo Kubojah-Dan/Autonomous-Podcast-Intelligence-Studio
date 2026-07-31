@@ -2,9 +2,26 @@ import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api, wsUrl } from "@/lib/api";
 import Terminal from "@/components/Terminal";
+import { ListenButton } from "@/components/ListenButton";
+import { ChaptersView } from "@/components/ChaptersView";
+import { FactCheckView } from "@/components/FactCheckView";
+import { ClipsView } from "@/components/ClipsView";
+import { SentimentView } from "@/components/SentimentView";
+import { GuestOutreachView } from "@/components/GuestOutreachView";
 import { toast } from "sonner";
 
-const TABS = ["OVERVIEW", "TOPICS", "QUOTES", "SHOW NOTES", "SOCIAL", "TRANSCRIPT"];
+const TABS = [
+  "OVERVIEW",
+  "AUDIO & TTS",
+  "CHAPTERS",
+  "TOPICS & SENTIMENT",
+  "QUOTES & CLIPS",
+  "SHOW NOTES",
+  "SOCIAL",
+  "FACT CHECK",
+  "GUEST & OUTREACH",
+  "TRANSCRIPT",
+];
 
 export default function Episode() {
   const { id } = useParams();
@@ -16,7 +33,6 @@ export default function Episode() {
   const [titleInput, setTitleInput] = useState("");
   const wsRef = useRef(null);
 
-  // Fetch initial doc
   useEffect(() => {
     api.get(`/episode/${id}`).then((r) => {
       setEpisode(r.data);
@@ -24,7 +40,6 @@ export default function Episode() {
     }).catch(() => {});
   }, [id]);
 
-  // WebSocket
   useEffect(() => {
     const ws = new WebSocket(wsUrl(`/api/agents/stream/${id}`));
     wsRef.current = ws;
@@ -76,7 +91,7 @@ export default function Episode() {
         {/* Header */}
         <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4 mb-8">
           <div className="flex-1">
-            <div className="flex items-center gap-3 mb-3">
+            <div className="flex items-center gap-3 mb-3 flex-wrap">
               <span className="border-4 border-black bg-black text-[#00FF41] px-3 py-1 text-xs font-bold uppercase tracking-widest">
                 JOB / {id.slice(0, 8)}
               </span>
@@ -88,6 +103,11 @@ export default function Episode() {
               >
                 {episode?.status || "loading"}
               </span>
+              {result.platform && (
+                <span className="border-4 border-black bg-white px-3 py-1 text-xs font-bold uppercase tracking-widest">
+                  {result.platform}
+                </span>
+              )}
             </div>
 
             {editingTitle ? (
@@ -116,7 +136,7 @@ export default function Episode() {
                 </button>
               </div>
             ) : (
-              <div className="flex items-center gap-3 group">
+              <div className="flex items-center gap-3 group flex-wrap">
                 <h1 className="font-display text-4xl md:text-6xl uppercase leading-none">
                   {displayTitle}
                 </h1>
@@ -148,12 +168,19 @@ export default function Episode() {
           </Link>
         </div>
 
+        {/* DRM Warning Notice */}
+        {result.drm_notice && (
+          <div className="mb-8 border-4 border-black bg-[#FFEB3B] p-4 shadow-[6px_6px_0px_0px_#000] font-mono text-sm font-bold flex items-center justify-between">
+            <span>⚠️ {result.drm_notice}</span>
+          </div>
+        )}
+
         {/* Grid: Terminal + Tabs */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           <div className="lg:col-span-5">
             <Terminal events={events} connected={connected} />
             <div className="mt-4 border-4 border-black bg-white p-4 shadow-[4px_4px_0px_0px_#000]">
-              <div className="text-xs font-bold uppercase tracking-widest mb-1">EVENTS</div>
+              <div className="text-xs font-bold uppercase tracking-widest mb-1">EVENTS LOGGED</div>
               <div className="font-mono text-2xl">{events.length}</div>
             </div>
           </div>
@@ -166,7 +193,7 @@ export default function Episode() {
                   key={t}
                   data-testid={`pv-tab-${t.replace(/\s/g, "-").toLowerCase()}`}
                   onClick={() => setTab(t)}
-                  className={`border-4 border-black px-4 py-2 text-xs font-bold uppercase tracking-widest ${
+                  className={`border-4 border-black px-3 py-1.5 text-xs font-bold uppercase tracking-widest ${
                     tab === t ? "bg-black text-[#FFEB3B]" : "bg-white hover:bg-[#FFEB3B]"
                   }`}
                 >
@@ -176,10 +203,24 @@ export default function Episode() {
             </div>
 
             {tab === "OVERVIEW" && <Overview result={result} running={running} onOpenTranscript={() => setTab("TRANSCRIPT")} />}
-            {tab === "TOPICS" && <Topics topics={result.topics} />}
-            {tab === "QUOTES" && <Quotes quotes={result.quotes} />}
-            {tab === "SHOW NOTES" && <ShowNotes md={result.show_notes_md} />}
-            {tab === "SOCIAL" && <Social social={result.social} />}
+            {tab === "AUDIO & TTS" && <AudioTab result={result} />}
+            {tab === "CHAPTERS" && <ChaptersView chapters={result.chapters} jobId={id} />}
+            {tab === "TOPICS & SENTIMENT" && (
+              <div className="space-y-8">
+                <Topics topics={result.topics} />
+                <SentimentView sentiment={result.sentiment} />
+              </div>
+            )}
+            {tab === "QUOTES & CLIPS" && (
+              <div className="space-y-8">
+                <Quotes quotes={result.quotes} />
+                <ClipsView clips={result.clips} quotes={result.quotes} />
+              </div>
+            )}
+            {tab === "SHOW NOTES" && <ShowNotes md={result.show_notes_md} title={displayTitle} />}
+            {tab === "SOCIAL" && <Social social={result.social} title={displayTitle} />}
+            {tab === "FACT CHECK" && <FactCheckView claims={result.claims} />}
+            {tab === "GUEST & OUTREACH" && <GuestOutreachView dossier={result.guest_dossier} host={result.host} guest={result.guest} />}
             {tab === "TRANSCRIPT" && <TranscriptView transcript={result.transcript} preview={result.transcript_preview} running={running} />}
           </div>
         </div>
@@ -202,7 +243,7 @@ function Overview({ result, running, onOpenTranscript }) {
     { k: "TRANSCRIPT", v: `${result.transcript_length || 0} chars` },
     { k: "TOPICS", v: (result.topics || []).length },
     { k: "QUOTES", v: (result.quotes || []).length },
-    { k: "SOCIAL", v: Object.keys(result.social || {}).length + " platforms" },
+    { k: "CHAPTERS", v: (result.chapters || []).length },
   ];
   const transcriptText = result.transcript || result.transcript_preview;
 
@@ -221,6 +262,25 @@ function Overview({ result, running, onOpenTranscript }) {
           </div>
         ))}
       </div>
+
+      {/* Briefing Player */}
+      <div className="border-4 border-black bg-[#00FF41] p-6 shadow-[8px_8px_0px_0px_#000] flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <span className="border-2 border-black bg-black text-white px-2 py-0.5 font-mono text-[10px] font-bold uppercase">
+            VOICE BRIEFING
+          </span>
+          <h3 className="font-display text-2xl uppercase mt-1">AUDIO SUMMARY NARRATION</h3>
+          <p className="font-mono text-xs text-black/80">Listen to the AI narrator summarize the key takeaways of this recording.</p>
+        </div>
+        <ListenButton
+          text={result.title ? `Overview for ${result.title}. ${result.show_notes_md || ''}` : "Episode Briefing"}
+          artifactId="overview_narration"
+          existingAudioUrl={result.overview_audio}
+          profile="narrator"
+          label="PLAY BRIEFING"
+        />
+      </div>
+
       <div className="border-4 border-black bg-white p-6 shadow-[8px_8px_0px_0px_#000]">
         <div className="flex items-center justify-between mb-3">
           <div className="text-xs font-bold uppercase tracking-widest underline decoration-2 underline-offset-4">
@@ -237,6 +297,67 @@ function Overview({ result, running, onOpenTranscript }) {
         </div>
         <div className="font-mono text-sm leading-relaxed whitespace-pre-wrap max-h-64 overflow-y-auto pr-2 border-t-2 border-black/10 pt-3">
           {transcriptText || (running ? "transcribing..." : "no transcript")}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AudioTab({ result }) {
+  if (!result?.title) return <Empty label="audio & tts" />;
+
+  return (
+    <div className="space-y-6">
+      <div className="border-4 border-black bg-black text-[#00FF41] p-6 shadow-[6px_6px_0px_0px_#000]">
+        <h2 className="font-display text-2xl uppercase">TEXT-TO-AUDIO MULTIMODAL HUB</h2>
+        <p className="font-mono text-xs text-white/80 mt-1">
+          Every generated artifact in PulseVault AI v2 can be converted to high-fidelity audio narration.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="border-4 border-black bg-white p-6 shadow-[6px_6px_0px_0px_#000] flex flex-col justify-between">
+          <div>
+            <span className="border-2 border-black bg-[#FFEB3B] px-2 py-0.5 font-mono text-[10px] font-bold uppercase">
+              EPISODE BRIEFING (NARRATOR)
+            </span>
+            <h3 className="font-display text-2xl uppercase mt-2">{result.title}</h3>
+            <p className="font-mono text-xs text-black/70 mt-2">
+              Full documentary-style audio narration of key topics & executive briefing.
+            </p>
+          </div>
+          <div className="mt-6">
+            <ListenButton
+              text={`Briefing for ${result.title}. ${result.show_notes_md || ''}`}
+              artifactId="audio_hub_briefing"
+              existingAudioUrl={result.overview_audio}
+              profile="narrator"
+              label="LISTEN BRIEFING"
+            />
+          </div>
+        </div>
+
+        <div className="border-4 border-black bg-white p-6 shadow-[6px_6px_0px_0px_#000] flex flex-col justify-between">
+          <div>
+            <span className="border-2 border-black bg-[#FF006E] text-white px-2 py-0.5 font-mono text-[10px] font-bold uppercase">
+              FEATURED QUOTE NARRATION
+            </span>
+            <h3 className="font-display text-2xl uppercase mt-2">
+              "{result.quotes?.[0]?.quote || 'Viral Quote Moment'}"
+            </h3>
+            <p className="font-mono text-xs text-black/70 mt-2">
+              Dramatic high-energy voice delivery of the top viral quote.
+            </p>
+          </div>
+          <div className="mt-6">
+            <ListenButton
+              text={result.quotes?.[0]?.quote || "Featured viral quote"}
+              artifactId="audio_hub_quote"
+              existingAudioUrl={result.quote_audio}
+              profile="dramatic"
+              label="LISTEN QUOTE"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -275,27 +396,35 @@ function TranscriptView({ transcript, preview, running }) {
 function Topics({ topics }) {
   if (!topics || topics.length === 0) return <Empty label="topics" />;
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-      {topics.map((t, i) => (
-        <div
-          key={i}
-          data-testid={`pv-topic-${i}`}
-          className={`border-4 border-black bg-white p-5 shadow-[6px_6px_0px_0px_#000] ${
-            i % 2 === 0 ? "rotate-[-0.5deg]" : "rotate-[0.5deg]"
-          }`}
-        >
-          <div className="flex items-center justify-between mb-2">
-            <span className="border-2 border-black bg-[#FFEB3B] px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest">
-              TOPIC / {String(i + 1).padStart(2, "0")}
-            </span>
-            {typeof t.importance === "number" && (
-              <span className="font-mono text-xs">■ {"█".repeat(Math.max(1, Math.min(10, t.importance)))}</span>
-            )}
+    <div className="space-y-4">
+      <h2 className="font-display text-2xl uppercase border-b-4 border-black pb-2">TOPIC MINER OUTPUT</h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {topics.map((t, i) => (
+          <div
+            key={i}
+            data-testid={`pv-topic-${i}`}
+            className={`border-4 border-black bg-white p-5 shadow-[6px_6px_0px_0px_#000] flex flex-col justify-between ${
+              i % 2 === 0 ? "rotate-[-0.5deg]" : "rotate-[0.5deg]"
+            }`}
+          >
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="border-2 border-black bg-[#FFEB3B] px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest">
+                  TOPIC / {String(i + 1).padStart(2, "0")}
+                </span>
+                {typeof t.importance === "number" && (
+                  <span className="font-mono text-xs">■ {"█".repeat(Math.max(1, Math.min(10, t.importance)))}</span>
+                )}
+              </div>
+              <div className="font-display text-xl md:text-2xl uppercase leading-tight">{t.topic}</div>
+              <div className="mt-2 font-mono text-sm text-black/80">{t.summary}</div>
+            </div>
+            <div className="mt-4 pt-3 border-t-2 border-dashed border-black/30">
+              <ListenButton text={`Topic: ${t.topic}. ${t.summary}`} artifactId={`topic_${i}`} profile="narrator" label="LISTEN TOPIC" />
+            </div>
           </div>
-          <div className="font-display text-xl md:text-2xl uppercase leading-tight">{t.topic}</div>
-          <div className="mt-2 font-mono text-sm text-black/80">{t.summary}</div>
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }
@@ -308,6 +437,7 @@ function Quotes({ quotes }) {
   };
   return (
     <div className="space-y-4">
+      <h2 className="font-display text-2xl uppercase border-b-4 border-black pb-2">VIRAL QUOTES</h2>
       {quotes.map((q, i) => (
         <div
           key={i}
@@ -315,17 +445,20 @@ function Quotes({ quotes }) {
           className="border-4 border-black bg-[#FFEB3B] p-5 shadow-[6px_6px_0px_0px_#000]"
         >
           <p className="font-display text-xl md:text-2xl leading-tight uppercase">"{q.quote}"</p>
-          <div className="mt-3 flex items-center justify-between">
+          <div className="mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="font-mono text-sm">
               — <span className="font-bold">{q.speaker || "Unknown"}</span>{" "}
               {q.punch && <span className="text-black/70">│ {q.punch}</span>}
             </div>
-            <button
-              onClick={() => copy(q)}
-              className="border-4 border-black bg-white px-3 py-1 text-xs font-bold uppercase tracking-widest hover:bg-black hover:text-[#FFEB3B]"
-            >
-              COPY
-            </button>
+            <div className="flex items-center gap-2">
+              <ListenButton text={q.quote} artifactId={`quote_${i}`} profile="dramatic" label="LISTEN" />
+              <button
+                onClick={() => copy(q)}
+                className="border-4 border-black bg-white px-3 py-2 text-xs font-bold uppercase tracking-widest hover:bg-black hover:text-[#FFEB3B]"
+              >
+                COPY
+              </button>
+            </div>
           </div>
         </div>
       ))}
@@ -415,7 +548,7 @@ function MarkdownView({ content }) {
   return <div className="p-6 space-y-2">{elements}</div>;
 }
 
-function ShowNotes({ md }) {
+function ShowNotes({ md, title }) {
   const [mode, setMode] = useState("RENDERED");
   if (!md) return <Empty label="show notes" />;
   const copy = () => {
@@ -424,7 +557,7 @@ function ShowNotes({ md }) {
   };
   return (
     <div className="border-4 border-black bg-white shadow-[8px_8px_0px_0px_#000]">
-      <div className="flex items-center justify-between border-b-4 border-black bg-[#FF006E] text-white px-4 py-2 flex-wrap gap-2">
+      <div className="flex items-center justify-between border-b-4 border-black bg-[#FF006E] text-white px-4 py-3 flex-wrap gap-2">
         <div className="flex items-center gap-3">
           <span className="font-display uppercase text-sm tracking-widest">SHOWNOTES.MD</span>
           <div className="flex border-2 border-black bg-white text-black">
@@ -446,12 +579,15 @@ function ShowNotes({ md }) {
             </button>
           </div>
         </div>
-        <button
-          onClick={copy}
-          className="border-2 border-black bg-white text-black px-3 py-1 text-[10px] font-bold uppercase tracking-widest hover:bg-[#FFEB3B]"
-        >
-          COPY .MD
-        </button>
+        <div className="flex items-center gap-2">
+          <ListenButton text={md} artifactId="show_notes" profile="narrator" label="LISTEN NOTES" />
+          <button
+            onClick={copy}
+            className="border-2 border-black bg-white text-black px-3 py-1 text-[10px] font-bold uppercase tracking-widest hover:bg-[#FFEB3B]"
+          >
+            COPY .MD
+          </button>
+        </div>
       </div>
       {mode === "RENDERED" ? (
         <MarkdownView content={md} />
@@ -464,36 +600,39 @@ function ShowNotes({ md }) {
   );
 }
 
-function Social({ social }) {
+function Social({ social, title }) {
   if (!social || Object.keys(social).length === 0) return <Empty label="social copy" />;
   const platforms = [
-    { key: "twitter", label: "TWITTER / X", color: "bg-black text-[#00FF41]" },
-    { key: "linkedin", label: "LINKEDIN", color: "bg-[#FF006E] text-white" },
-    { key: "instagram", label: "INSTAGRAM", color: "bg-[#FFEB3B] text-black" },
+    { k: "twitter", label: "TWITTER / X", color: "bg-black text-white" },
+    { k: "linkedin", label: "LINKEDIN", color: "bg-[#0077B5] text-white" },
+    { k: "instagram", label: "INSTAGRAM", color: "bg-[#E4405F] text-white" },
   ];
-  const copy = (text) => {
-    navigator.clipboard.writeText(text);
-    toast.success("> copied to clipboard");
-  };
   return (
-    <div className="space-y-5">
-      {platforms.map(
-        (p) =>
-          social[p.key] && (
-            <div key={p.key} className="border-4 border-black bg-white shadow-[6px_6px_0px_0px_#000]">
-              <div className={`flex items-center justify-between border-b-4 border-black px-4 py-2 ${p.color}`}>
-                <div className="font-display uppercase text-sm tracking-widest">{p.label}</div>
+    <div className="space-y-6">
+      {platforms.map((p) => {
+        const text = social[p.k];
+        if (!text) return null;
+        return (
+          <div key={p.k} className="border-4 border-black bg-white shadow-[8px_8px_0px_0px_#000]">
+            <div className={`flex items-center justify-between border-b-4 border-black px-4 py-2 ${p.color}`}>
+              <span className="font-display uppercase text-sm tracking-widest">{p.label}</span>
+              <div className="flex items-center gap-2">
+                <ListenButton text={text} artifactId={`social_${p.k}`} profile="punchy" label="LISTEN CAPTION" />
                 <button
-                  onClick={() => copy(social[p.key])}
-                  className="border-2 border-black bg-white text-black px-3 py-1 text-[10px] font-bold uppercase tracking-widest"
+                  onClick={() => {
+                    navigator.clipboard.writeText(text);
+                    toast.success(`> ${p.k} caption copied`);
+                  }}
+                  className="border-2 border-black bg-white text-black px-3 py-1 text-[10px] font-bold uppercase tracking-widest hover:bg-[#FFEB3B]"
                 >
-                  COPY
+                  COPY CAPTION
                 </button>
               </div>
-              <div className="p-4 font-mono text-sm whitespace-pre-wrap">{social[p.key]}</div>
             </div>
-          ),
-      )}
+            <pre className="p-6 font-mono text-sm leading-relaxed whitespace-pre-wrap">{text}</pre>
+          </div>
+        );
+      })}
     </div>
   );
 }
